@@ -1,18 +1,17 @@
 package taosRestful
 
 import (
-	"compress/gzip"
+	"bytes"
 	"context"
 	"database/sql/driver"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/go-resty/resty/v2"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -24,11 +23,28 @@ var jsonI = jsoniter.ConfigCompatibleWithStandardLibrary
 
 type taosConn struct {
 	cfg            *config
-	client         *http.Client
+	client         *resty.Client
 	url            *url.URL
-	header         map[string][]string
+	header         map[string]string
 	readBufferSize int
 }
+
+var httpClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression:    true,
+		MaxIdleConnsPerHost:   100,
+	},
+}
+
+var client = resty.NewWithClient(httpClient)
 
 func newTaosConn(cfg *config) (*taosConn, error) {
 	readBufferSize := cfg.readBufferSize
@@ -36,19 +52,8 @@ func newTaosConn(cfg *config) (*taosConn, error) {
 		readBufferSize = 4 << 10
 	}
 	tc := &taosConn{cfg: cfg, readBufferSize: readBufferSize}
-	tc.client = &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-			DisableCompression:    cfg.disableCompression,
-		},
-	}
+	tc.client = client
+	tc.client.RetryCount = 0
 	path := "/rest/sql"
 	if len(cfg.dbName) != 0 {
 		path = fmt.Sprintf("%s/%s", path, cfg.dbName)
@@ -58,17 +63,17 @@ func newTaosConn(cfg *config) (*taosConn, error) {
 		Host:   fmt.Sprintf("%s:%d", cfg.addr, cfg.port),
 		Path:   path,
 	}
-	tc.header = map[string][]string{
-		"Connection": {"keep-alive"},
+	tc.header = map[string]string{
+		"Connection": "keep-alive",
 	}
 	if cfg.token != "" {
 		tc.url.RawQuery = fmt.Sprintf("token=%s", cfg.token)
 	} else {
 		basic := base64.StdEncoding.EncodeToString([]byte(cfg.user + ":" + cfg.passwd))
-		tc.header["Authorization"] = []string{fmt.Sprintf("Basic %s", basic)}
+		tc.header["Authorization"] = fmt.Sprintf("Basic %s", basic)
 	}
 	if !cfg.disableCompression {
-		tc.header["Accept-Encoding"] = []string{"gzip"}
+		tc.header["Accept-Encoding"] = "gzip"
 	}
 	return tc, nil
 }
@@ -184,40 +189,36 @@ func (tc *taosConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.
 }
 
 func (tc *taosConn) taosQuery(ctx context.Context, sql string, bufferSize int) (*common.TDEngineRestfulResp, error) {
-	body := ioutil.NopCloser(strings.NewReader(sql))
-	req := &http.Request{
-		Method:     http.MethodPost,
-		URL:        tc.url,
-		Proto:      "HTTP/1.1",
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-		Header:     tc.header,
-		Body:       body,
-		Host:       tc.url.Host,
-	}
+	//body := ioutil.NopCloser(strings.NewReader(sql))
+	//req := &http.Request{
+	// Method:     http.MethodPost,
+	// URL:        tc.url,
+	// Proto:      "HTTP/1.1",
+	// ProtoMajor: 1,
+	// ProtoMinor: 1,
+	// //Header:     tc.header,
+	// Body: body,
+	// Host: tc.url.Host,
+	//}
+	//if ctx != nil {
+	// req = req.WithContext(ctx)
+	//}
+
+	request := tc.client.R().SetContext(ctx).SetHeaders(tc.header)
 	if ctx != nil {
-		req = req.WithContext(ctx)
+		request.SetContext(ctx)
 	}
-	resp, err := tc.client.Do(req)
+	request.SetBody(sql)
+	request.URL = tc.url.Path
+	buildUrl := tc.url.String()
+	resp, err := request.Post(buildUrl)
+
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return nil, err
-		}
-		return nil, fmt.Errorf("server response: %s - %s", resp.Status, string(body))
-	}
-	respBody := resp.Body
-	defer ioutil.ReadAll(respBody)
-	if !tc.cfg.disableCompression && EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
-		respBody, err = gzip.NewReader(resp.Body)
-		if err != nil {
-			return nil, err
-		}
-	}
+
+	respBody := io.NopCloser(bytes.NewReader(resp.Body()))
+
 	data, err := marshalBody(respBody, bufferSize)
 	if err != nil {
 		return nil, err
